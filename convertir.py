@@ -27,23 +27,6 @@ RASGO_MARGEN_MM = 9.0  # margen protegido alrededor de esos rasgos (cubre la car
 ZONA_CLASES = 24       # numero de familias de color para agrupar superficies lisas
 ZONA_TOL = 12.0        # una cara solo toma el tono de su zona si se parece a su propio color
 ZONA_MIN_MM2 = 30.0    # superficies lisas desde este tamano se pintan de un solo tono
-# ---- modo FISICO (bustos y torsos: conserva sombreado muscular y pezones) ----
-FISICO = False
-FIS_OSCURO_L = 6.0     # un punto pequeno al menos asi de mas oscuro que su entorno (luminosidad) es un detalle (pezon, ombligo)
-FIS_DE = 10.0          # diferencia de color minima de ese punto con su entorno
-FIS_MAX_MM2 = 30.0     # tamano maximo de esos detalles
-FIS_UNIF_MM2 = 6.0     # en modo fisico solo se funden manchitas muy pequenas...
-FIS_UNIF_DE = 6.0      # ...y casi del mismo tono, para no borrar el sombreado
-FIXC_HUE = 0.35       # Fix C: coste por grado de cambio de matiz
-FIXC_SAT = 25.0       # Fix C: coste de perder intensidad (se prefiere mantener el color)
-FIXB = True           # Fix B: mezcla suave entre dos tonos casi iguales en degradados
-FIXB_DE = 4.0         # solo entre tonos a menos de esta distancia (nunca colores distintos: sin 'viruela')
-FIXB_CELDA_MM = 1.0   # tamano de cada celda de la mezcla
-FIXB_DE = 6.0         # Fix B: solo se difuminan bordes entre tonos a menos de esta distancia
-FIXB_ANCHO_MM = 1.5   # Fix B: ancho de la franja de difuminado a cada lado del borde
-FIXB_CELDA_MM = 1.0   # Fix B: tamano de cada celda de un solo tono
-QC_BIEN = 6.0         # Fix F: diferencia (dE) considerada correcta
-QC_AVISO = 12.0       # Fix F: a partir de aqui se marca como problema
 ISLA_MIN_MM2 = 2.0     # zonas de color mas pequenas que esto se funden con su vecina
 N_VIRTUALES = 105
 PASO_RATIO = 0.05
@@ -131,49 +114,6 @@ def dist(A, B):
     wH = 1 + 1.5 * np.clip(Ca / 15, 0, 1)[:, None]          # en colores con tono definido, el tono pesa mas
     return np.sqrt(dL * dL + dC * dC + wH * wH * dH2).astype(np.float32)
 
-def tono_grados(L):
-    return np.degrees(np.arctan2(L[..., 2], L[..., 1]))
-
-def coste_fixc(blk, PL):
-    """Fix C: penaliza cambiar de matiz (evita azulados, lilas, rosados donde no los hay)"""
-    Ca = np.hypot(blk[:, 1], blk[:, 2]); Cp = np.hypot(PL[:, 1], PL[:, 2])
-    dh = np.abs((tono_grados(blk)[:, None] - tono_grados(PL)[None] + 180) % 360 - 180)
-    peso = np.clip((Ca - 1.5) / 6, 0, 1)[:, None] * np.clip((np.maximum(Cp, Ca.max() if len(Ca) else 0) * 0 + Cp - 0.5) / 4, 0, 1)[None]
-    gris = 2.0 * np.maximum(Cp[None] - Ca[:, None] - 3.0, 0) * (Ca < 8)[:, None]   # un gris no se vuelve de color
-    return FIXC_HUE * peso * dh + gris
-
-def mapear_gama(L, PL):
-    """Fix C: si un color no se puede lograr, se conserva su matiz y se reduce solo su intensidad,
-    igual para todas las caras con ese color (resultado coherente en toda la zona)"""
-    out = L.copy(); mejor = np.full(len(L), np.inf)
-    for s_ in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4):
-        Ls = L.copy(); Ls[:, 1:] *= s_
-        d = np.empty(len(L))
-        for i in range(0, len(L), 25000):
-            blk = Ls[i:i + 25000]; d[i:i + 25000] = (dist(blk, PL) + coste_fixc(blk, PL)).min(1)
-        tot = d + FIXC_SAT * (1 - s_)
-        m = tot < mejor; mejor[m] = tot[m]; out[m] = Ls[m]
-    return out
-
-def mezcla_suave(idx, Lc, PL, Wp, zona, cen3d):
-    """Fix B: donde el color real cae entre dos tonos de la paleta casi iguales (dE < FIXB_DE),
-    se alternan ambos en celdas de 1 mm con un patron ordenado; a distancia se ve un degradado continuo."""
-    out = idx.copy(); caras = np.nonzero(zona)[0]
-    if not len(caras): return out
-    q = np.floor(cen3d[caras] / FIXB_CELDA_MM).astype(int)
-    umbral = BAYER[(q[:, 0] + q[:, 2]) % 8, (q[:, 1] + 3 * q[:, 2]) % 8]
-    for i in range(0, len(caras), 25000):
-        cf = caras[i:i + 25000]; blk = Lc[cf]
-        coste = dist(blk, PL) + penal_piel(blk, Wp) + coste_fixc(blk, PL)
-        o = np.argsort(coste, 1)[:, :2]; j1, j2 = o[:, 0], o[:, 1]
-        a = PL[j1]; b = PL[j2]; v = b - a
-        cerca = np.linalg.norm(v, axis=1) < FIXB_DE
-        t = np.clip(((blk - a) * v).sum(1) / ((v * v).sum(1) + 1e-9), 0, 1)
-        propio = idx[cf] == j1                        # solo donde la limpieza no cambio el tono
-        usa2 = cerca & propio & (umbral[i:i + 25000] < t)
-        out[cf[usa2]] = j2[usa2]
-    return out
-
 def penal_piel(Lt, Wp):
     """en tonos claros y calidos (piel, pelo rubio) castiga mezclas con cian o negro, que ensucian"""
     calido = (Lt[:, 0] > 55) & (Lt[:, 1] > -3) & (Lt[:, 2] > 3)
@@ -196,64 +136,6 @@ def elegir_paleta(W, rgb, muestras, k):
         g = (peso[:, None] * np.maximum(cur[:, None] - D, 0)).sum(0); g[sel] = -1
         j = int(g.argmax()); sel.append(j); cur = np.minimum(cur, D[:, j])
     return W[sel], rgb[sel]
-
-def candidatos_extra():
-    """Fix A: grises con matiz (verdoso, calido, azulado...): blanco + negro + pizcas de dos colores.
-    Solo se usan para el resto del modelo; la paleta de la cara no cambia."""
-    out = []
-    for c1, c2 in ((0, 2), (1, 2), (0, 1)):              # C+Y, M+Y, C+M
-        for w in range(0, 11):
-            for k in range(0, 11):
-                for a in range(0, 4):
-                    for b in range(0, 4):
-                        if a + b == 0 or w + k + a + b != 10: continue
-                        v = np.zeros(5); v[3] = w / 10; v[4] = k / 10; v[c1] = a / 10; v[c2] = b / 10; out.append(v)
-    W = np.unique(np.round(np.array(out), 4), axis=0); return W, mezcla(W)
-
-def elegir_familias(W, rgb, mlab, k, previos_lab):
-    """Fix A: elige k virtuales repartidos por familias de color: cada tono distinto del modelo pesa igual,
-    sin importar cuanta superficie ocupa (una piel con mucho sombreado recibe muchos tonos)"""
-    L = lab(rgb).astype(np.float32); m = mlab.astype(np.float32)
-    cur = dist(m, previos_lab.astype(np.float32)).min(1)
-    D = np.empty((len(m), len(L)), np.float32)
-    for s0 in range(0, len(L), 500):
-        D[:, s0:s0 + 500] = dist(m, L[s0:s0 + 500])
-    D += penal_piel(m, W) + coste_fixc(m, L)
-    q = np.round(m / 4).astype(int); _, inv, cnt = np.unique(q, axis=0, return_inverse=True, return_counts=True)
-    peso = 1.0 / cnt[inv.ravel()]
-    sel = []
-    for _ in range(k):
-        g = (peso[:, None] * np.maximum(cur[:, None] - D, 0)).sum(0); g[sel] = -1
-        j = int(g.argmax()); sel.append(j); cur = np.minimum(cur, D[:, j])
-    return W[sel], rgb[sel]
-
-BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) / 16.0
-
-def suavizar_escalones(idx, N, V, FV, PL, proteger, lado):
-    """Fix B: donde dos tonos MUY parecidos se tocan, el borde se difumina en una franja estrecha
-    alternando los dos tonos en celdas de 1 mm (no son puntitos: cada celda es de un solo tono).
-    Nunca se toca la cara ni los detalles protegidos, ni bordes entre colores distintos."""
-    ok = N >= 0; Nn = np.where(ok, N, 0)
-    vec = np.where(ok, idx[Nn], -1)
-    dE = np.where(ok, np.linalg.norm(PL[idx][:, None] - PL[np.where(vec >= 0, vec, 0)], axis=2), 1e9)
-    cand = ok & (vec != idx[:, None]) & (dE < FIXB_DE)
-    otro = np.where(cand.any(1), vec[np.arange(len(idx)), cand.argmax(1)], -1)
-    otro[proteger] = -1
-    dist_h = np.where(otro >= 0, 0, 10 ** 6)
-    R = int(np.clip(FIXB_ANCHO_MM / max(lado, 1e-6), 2, 40))
-    for h in range(1, R + 1):                      # la franja crece hacia dentro de cada zona
-        prop = (dist_h[Nn] == h - 1) & ok & (idx[Nn] == idx[:, None])
-        nuevo = (dist_h > h) & prop.any(1) & ~proteger
-        j = prop.argmax(1)
-        otro = np.where(nuevo, otro[Nn[np.arange(len(idx)), j]], otro)
-        dist_h = np.where(nuevo, h, dist_h)
-    banda = (otro >= 0) & (dist_h <= R) & ~proteger
-    t = 0.5 * (1 - dist_h / (R + 1))              # 50 % en el borde, 0 % al final de la franja
-    cen = V[FV].mean(1); q = np.floor(cen / FIXB_CELDA_MM).astype(np.int64)
-    umbral = BAYER4[(q[:, 0] + q[:, 2]) % 4, (q[:, 1] + 2 * q[:, 2]) % 4]
-    cambia = banda & (umbral < t)
-    out = idx.copy(); out[cambia] = otro[cambia]
-    return out
 
 # ---------------- OBJ ----------------
 def cargar_obj(path):
@@ -458,7 +340,7 @@ def print(*a, **k):
     k.setdefault('flush', True); builtins.print(*a, **k)
 class Progreso:
     """muestra el paso actual, una barra y un contador de segundos para que se vea que el programa sigue trabajando"""
-    TOTAL = 18
+    TOTAL = 12
     def __init__(self):
         self.t0 = time.time(); self.n = 0; self.txt = ''; self.ts = time.time()
         self.activo = True; threading.Thread(target=self._latido, daemon=True).start()
@@ -474,35 +356,6 @@ class Progreso:
     def fin(self):
         self.activo = False
         print(f'\r{" " * 70}\r[####################] 100%  Terminado en {int(time.time() - self.t0)} s', flush=True)
-
-def control_calidad(V, FV, col, PAL, idx, PL, area, carpeta):
-    """Fix F: compara cada zona con el original y genera control_calidad.png:
-    verde = correcto, amarillo = ligera diferencia, rojo = diferencia que el convertidor podria mejorar,
-    morado = color imposible con estos filamentos (limite fisico, no error)"""
-    Lo = lab(col); de = np.linalg.norm(Lo - PL[idx], axis=1)
-    mejor = np.empty(len(Lo))
-    for i in range(0, len(Lo), 25000):
-        mejor[i:i + 25000] = np.linalg.norm(Lo[i:i + 25000, None] - PL[None], axis=2).min(1)
-    cat = np.where(de < QC_BIEN, 0, np.where(de < QC_AVISO, 1, np.where(mejor >= QC_AVISO, 3, 2)))
-    colores = np.array([[0.25, 0.75, 0.3], [0.98, 0.85, 0.2], [0.9, 0.15, 0.15], [0.6, 0.3, 0.8]])
-    Vb = V * np.array([-1, -1, 1])                       # vista de espalda
-    fil = []
-    for VV in (V, Vb):
-        fil.append([render(VV, FV, col, 420), render(VV, FV, PAL[idx], 420), render(VV, FV, colores[cat], 420)])
-    from PIL import ImageDraw
-    img = Image.new('RGB', (1280, 940), 'white'); d = ImageDraw.Draw(img)
-    for k, t in enumerate(['Original', 'Resultado', 'Control (ver leyenda)']): d.text((20 + 425 * k, 8), t, fill='black')
-    for j, fila in enumerate(fil):
-        d.text((5, 30 + j * 440), 'Frente' if j == 0 else 'Espalda', fill='gray')
-        for k, im in enumerate(fila): img.paste(im, (5 + 425 * k, 45 + j * 440))
-    tot = area.sum(); pct = [100 * area[cat == k].sum() / tot for k in range(4)]
-    ley = ['Verde: correcto', 'Amarillo: ligera diferencia', 'Rojo: diferencia mejorable', 'Morado: color imposible con estos filamentos']
-    for k in range(4):
-        d.rectangle([20 + 310 * k, 912, 34 + 310 * k, 926], fill=tuple((colores[k] * 255).astype(int)))
-        d.text((40 + 310 * k, 912), f'{ley[k]} ({pct[k]:.1f} %)', fill='black')
-    img.save(os.path.join(carpeta, 'control_calidad.png'))
-    return [f'Control de calidad (superficie): correcto {pct[0]:.1f} % | ligera diferencia {pct[1]:.1f} % | '
-            f'mejorable {pct[2]:.1f} % | imposible con estos filamentos {pct[3]:.1f} %  -> ver control_calidad.png']
 
 ULTIMO = {}
 # ---------------- principal ----------------
@@ -578,22 +431,10 @@ def convertir(path, altura):
     if len(ids) and vecin.max() >= CARA_MIN_RASGOS:
         # la cara es el grupo mas denso de rasgos; se protege una esfera alrededor de su centro
         centro = cc_[vecin == vecin.max()].mean(0)
-        if FISICO:
-            # en bustos/torsos la cara es el grupo de rasgos mas alto (evita confundirla con cordones o logotipos)
-            cand = np.nonzero(vecin >= CARA_MIN_RASGOS)[0]
-            top = cand[cc_[cand, 2].argmax()]
-            grupo = np.linalg.norm(cc_ - cc_[top], axis=1) < CARA_RADIO_MM
-            centro = cc_[grupo].mean(0)
         sel = np.linalg.norm(cc_ - centro, axis=1) < CARA_RADIO_MM
         pts = cc_[sel]; rad = np.linalg.norm(pts - centro, axis=1).max() + RASGO_MARGEN_MM
         cara = np.linalg.norm(cen - centro, axis=1) < rad
     proteger = rasgo_ok | cara
-    if FISICO:
-        osc = (entorno[:, 0] - Lo[:, 0] > FIS_OSCURO_L) & (dif > FIS_DE)
-        mo = (c >= 0) & osc[r] & osc[cv]
-        no_, co_ = connected_components(coo_matrix((np.ones(mo.sum()), (r[mo], c[mo])), shape=(len(FV),) * 2), directed=False)
-        ao = np.bincount(co_, weights=area * osc, minlength=no_)
-        proteger = proteger | (osc & (ao[co_] < FIS_MAX_MM2))
     for _ in range(3): proteger = proteger | (proteger[Nn] & okN).any(1)
     # color: zona protegida igual que antes (nitido en el detalle); resto con suavizado fuerte y uniforme
     PR.paso('Suavizando el color de piel y telas (el paso mas largo)')
@@ -601,107 +442,55 @@ def convertir(path, altura):
     Lc[detalle & proteger] = suavizar(Lo, N, 1, sigma=6.0)[detalle & proteger]
     pasos_piel = int(np.clip((SUAVIZADO_PIEL_MM / max(lado, 1e-6)) ** 2, pasos, 200))
     Lp = suavizar(Lc, N, pasos_piel - pasos, sigma=8.0) if pasos_piel > pasos else Lc
-    if not FISICO: Lc = np.where(proteger[:, None], Lc, Lp)       # en fisico se conserva el sombreado
+    Lc = np.where(proteger[:, None], Lc, Lp)
     Wp = np.vstack([np.eye(5)[MODO['usables']], WV])
-    # Fix C: dos pasadas. La cara y los rasgos protegidos salen de la pasada SIN Fix C (identicos a la version aprobada);
-    # el resto del modelo sale de la pasada CON Fix C.
-    resultados = {}
-    for _fc in (False, True):
-        if _fc:
-            # Fix A: se conservan los tonos que usa la cara (identica a la version aprobada)
-            # y el resto de los 105 se reparte por familias de color del resto del modelo
-            PR.paso('Repartiendo los 105 colores por familias (piel, telas, metal...)')
-            viejo = resultados[False]
-            res_v = np.unique(viejo[proteger]); res_v = res_v[res_v >= nu] - nu
-            libre_ = np.nonzero(~proteger)[0]
-            rng_a = np.random.default_rng(3)
-            if len(libre_):
-                pa = area[libre_] / area[libre_].sum()
-                smp_a = libre_[rng_a.choice(len(libre_), min(12000, len(libre_)), replace=False, p=pa)]
-                mlab = mapear_gama(Lc[smp_a], PL)
-                previos = np.vstack([lab(base_usable()), lab(PV[res_v])]) if len(res_v) else lab(base_usable())
-                We, re_ = candidatos_extra(); W2 = np.vstack([W, We]); rgb2 = np.vstack([rgb, re_])
-                WVn, PVn = elegir_familias(W2, rgb2, mlab, N_VIRTUALES - len(res_v), previos)
-            else:
-                WVn, PVn = WV[:0], PV[:0]
-            mapa = np.arange(nu + len(PV)); mapa[nu + res_v] = nu + np.arange(len(res_v))
-            WV = np.vstack([WV[res_v], WVn]); PV = np.vstack([PV[res_v], PVn])
-            PAL = np.vstack([base_usable(), PV]); PL = lab(PAL)
-            id_de = np.array([u + 1 for u in MODO['usables']] + [nf + 1 + k for k in range(len(PV))])
-            Wp = np.vstack([np.eye(5)[MODO['usables']], WV])
-            resultados[False] = mapa[viejo]
-        PR.paso('Asignando un color a cada cara' + (' (cara y detalles)' if not _fc else ' (resto del modelo)'))
-        idx = np.empty(len(Lc), int)
-        libre = ~proteger
-        Lm = Lc.copy()
-        if _fc: Lm[libre] = mapear_gama(Lc[libre], PL)
-        for s0 in range(0, len(Lc), 25000):
-            blk = Lc[s0:s0 + 25000]
-            coste = dist(blk, PL) + penal_piel(blk, Wp)
-            if FISICO:   # grises (telas, marmol, metal) no deben tomar tonos azulados o rosados
-                Ca = np.hypot(blk[:, 1], blk[:, 2]); Cp = np.hypot(PL[:, 1], PL[:, 2])
-                coste = coste + 2.0 * np.maximum(Cp[None] - Ca[:, None] - 3.0, 0) * (Ca < 10)[:, None]
-            fc = libre[s0:s0 + 25000]
-            if _fc and fc.any():
-                bm = Lm[s0:s0 + 25000][fc]
-                coste[fc] = dist(bm, PL) + penal_piel(bm, Wp) + coste_fixc(bm, PL)
-            idx[s0:s0 + 25000] = coste.argmin(1)
-        idx = np.where(proteger, idx, mayoria(idx, N))
-        # superficies lisas: se agrupan por continuidad de color y cada zona grande recibe UN solo tono (sin parches)
-        # clases de color gruesas (k-medias): la piel es una clase, el traje otra... no se encadenan entre si
-        PR.paso(('Unificando superficies lisas en un solo tono' if not FISICO else 'Conservando el sombreado muscular') + (' (cara y detalles)' if not _fc else ' (resto del modelo)'))
-        clase = None
-        plano = np.zeros(len(FV), bool)
-        if not FISICO:
-          rng = np.random.default_rng(2); smp = Lc[rng.choice(len(Lc), min(60000, len(Lc)), replace=False)]
-          cen = smp[rng.choice(len(smp), ZONA_CLASES, replace=False)]
-          for _ in range(15):
-              a_ = dist(smp, cen).argmin(1)
-              for k in range(ZONA_CLASES):
-                  if (a_ == k).any(): cen[k] = smp[a_ == k].mean(0)
-          clase = np.concatenate([dist(Lc[i:i + 200000], cen).argmin(1) for i in range(0, len(Lc), 200000)])
-          cv2 = np.where(c >= 0, c, 0)
-          ok2 = (c >= 0) & ~proteger[r] & ~proteger[cv2] & (clase[r] == clase[cv2])
-          ns, seg = connected_components(coo_matrix((np.ones(ok2.sum()), (r[ok2], c[ok2])), shape=(len(FV),) * 2), directed=False)
-          a_s = np.bincount(seg, weights=area, minlength=ns)
-          med = np.stack([np.bincount(seg, weights=area * Lc[:, j], minlength=ns) for j in range(3)], 1) / np.maximum(a_s, 1e-12)[:, None]
-          grande = (a_s >= ZONA_MIN_MM2)[seg] & ~proteger
-          if grande.any():
-              gs = np.nonzero(a_s >= ZONA_MIN_MM2)[0]
-              tono = np.zeros(ns, int); mg = mapear_gama(med[gs], PL) if _fc else med[gs]; tono[gs] = (dist(mg, PL) + penal_piel(mg, Wp) + (coste_fixc(mg, PL) if _fc else 0)).argmin(1)
-              cerca = np.linalg.norm(Lc - PL[tono[seg]], axis=1) < ZONA_TOL      # nunca pintar una cara con un tono lejano al suyo
-              idx = np.where(grande & cerca, tono[seg], idx); plano = grande & cerca
-        PR.paso('Quitando manchas y zonas sueltas' + (' (cara y detalles)' if not _fc else ' (resto del modelo)'))
-        idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL, proteger=detalle & proteger)
-        # uniformidad fuera de la zona protegida: parches de tono parecido se funden (piel, telas lisas)
-        if FISICO:
-            idx = quitar_islas(idx, N, area, FIS_UNIF_MM2, Lref=Lc, PL=PL, tol=FIS_UNIF_DE, proteger=proteger)
-        else:
-            idx = quitar_islas(idx, N, area, UNIFORME_MM2, Lref=Lc, PL=PL, tol=UNIFORME_DE, proteger=proteger)
-        if _fc and FIXB:
-            idx = mezcla_suave(idx, Lc, PL, Wp, ~proteger & ~plano, V[FV].mean(1))
-        resultados[_fc] = idx
-    idx = np.where(proteger, resultados[False], resultados[True])
-    PR.paso('Suavizando los escalones entre tonos parecidos')
-    idx = suavizar_escalones(idx, N, V, FV, PL, proteger, lado)
+    PR.paso('Asignando un color a cada cara')
+    idx = np.empty(len(Lc), int)
+    for s0 in range(0, len(Lc), 100000):
+        blk = Lc[s0:s0 + 100000]
+        idx[s0:s0 + 100000] = (dist(blk, PL) + penal_piel(blk, Wp)).argmin(1)
+    idx = np.where(proteger, idx, mayoria(idx, N))
+    # superficies lisas: se agrupan por continuidad de color y cada zona grande recibe UN solo tono (sin parches)
+    # clases de color gruesas (k-medias): la piel es una clase, el traje otra... no se encadenan entre si
+    PR.paso('Unificando superficies lisas en un solo tono')
+    rng = np.random.default_rng(2); smp = Lc[rng.choice(len(Lc), min(60000, len(Lc)), replace=False)]
+    cen = smp[rng.choice(len(smp), ZONA_CLASES, replace=False)]
+    for _ in range(15):
+        a_ = dist(smp, cen).argmin(1)
+        for k in range(ZONA_CLASES):
+            if (a_ == k).any(): cen[k] = smp[a_ == k].mean(0)
+    clase = np.concatenate([dist(Lc[i:i + 200000], cen).argmin(1) for i in range(0, len(Lc), 200000)])
+    cv2 = np.where(c >= 0, c, 0)
+    ok2 = (c >= 0) & ~proteger[r] & ~proteger[cv2] & (clase[r] == clase[cv2])
+    ns, seg = connected_components(coo_matrix((np.ones(ok2.sum()), (r[ok2], c[ok2])), shape=(len(FV),) * 2), directed=False)
+    a_s = np.bincount(seg, weights=area, minlength=ns)
+    med = np.stack([np.bincount(seg, weights=area * Lc[:, j], minlength=ns) for j in range(3)], 1) / np.maximum(a_s, 1e-12)[:, None]
+    grande = (a_s >= ZONA_MIN_MM2)[seg] & ~proteger
+    if grande.any():
+        gs = np.nonzero(a_s >= ZONA_MIN_MM2)[0]
+        tono = np.zeros(ns, int); tono[gs] = (dist(med[gs], PL) + penal_piel(med[gs], Wp)).argmin(1)
+        cerca = np.linalg.norm(Lc - PL[tono[seg]], axis=1) < ZONA_TOL      # nunca pintar una cara con un tono lejano al suyo
+        idx = np.where(grande & cerca, tono[seg], idx)
+    PR.paso('Quitando manchas y zonas sueltas')
+    idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL, proteger=detalle & proteger)
+    # uniformidad fuera de la zona protegida: parches de tono parecido se funden (piel, telas lisas)
+    idx = quitar_islas(idx, N, area, UNIFORME_MM2, Lref=Lc, PL=PL, tol=UNIFORME_DE, proteger=proteger)
     if os.environ.get('DEPURAR'): np.savez(os.environ['DEPURAR'], V=V, F=FV, co=col_orig, P=PAL, i=idx)
     estados = id_de[idx]                  # ids de PrusaSlicer: fisicos 1..N, virtuales N+1..
-    carpeta = os.path.join(os.path.dirname(path), f'{nombre}_prusa_{MODO["sufijo"]}' + ('_fisico' if FISICO else '')); os.makedirs(carpeta, exist_ok=True)
+    carpeta = os.path.join(os.path.dirname(path), f'{nombre}_prusa_{MODO["sufijo"]}'); os.makedirs(carpeta, exist_ok=True)
     PR.paso('Creando la vista previa')
     prev = [render(V, FV, col_orig), render(V, FV, PAL[idx])]
     vp = Image.new('RGB', (1220, 640), 'white'); vp.paste(prev[0], (0, 40)); vp.paste(prev[1], (620, 40))
     from PIL import ImageDraw; d = ImageDraw.Draw(vp); d.text((20, 10), 'Original', fill='black'); d.text((640, 10), f'{MODO["nombre"]} - ColorMix ({len(MODO["usables"])} reales + {len(PV)} virtuales)', fill='black')
     vp.save(os.path.join(carpeta, 'vista_previa.png'))
-    PR.paso('Revisando la calidad del color (control automatico)')
-    calidad = control_calidad(V, FV, col, PAL, idx, PL, area, carpeta)
     ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx, prot=proteger, det=detalle, Lc=Lc, clase=clase)
     out = os.path.join(carpeta, f'{nombre}_colormix.3mf')
     PR.paso('Escribiendo el archivo 3MF')
     escribir_3mf(out, nombre, V, FV, estados, WV, PV, prev[1].resize((256, 256)))
     dE = np.linalg.norm(lab(col) - PL[idx], axis=1)
-    rep = [f'Impresora: {MODO["nombre"]}', f'Modo de color: {"Fisico (sombreado muscular)" if FISICO else "Normal"}', f'Archivo: {path}', f'Triangulos: {len(FV):,}', f'Altura: {V[:, 2].max():.1f} mm',
+    rep = [f'Impresora: {MODO["nombre"]}', f'Archivo: {path}', f'Triangulos: {len(FV):,}', f'Altura: {V[:, 2].max():.1f} mm',
            f'Colores usados: {len(np.unique(idx))} de {len(PAL)}', f'Error de color por cara (dE) medio: {dE.mean():.1f}',
-           *calidad, f'Salida: {out}', f'Tiempo: {time.time() - t0:.0f} s']
+           f'Salida: {out}', f'Tiempo: {time.time() - t0:.0f} s']
     PR.fin()
     open(os.path.join(carpeta, 'reporte.txt'), 'w', encoding='utf-8').write('\n'.join(rep)); print('\n'.join(rep))
 
@@ -712,16 +501,8 @@ def main():
         if f in args: modo = f; args.remove(f)
     if modo is None:
         print('Elige la impresora:\n  1) Prusa MMU3  (5 filamentos)\n  2) Prusa INDX 8 (7 cabezales: C M Y W K + Gold + Silver)')
-        try: modo = '--indx8' if input('Opcion [1/2]: ').strip() == '2' else '--mmu3'
-        except EOFError: modo = '--mmu3'
+        modo = '--indx8' if input('Opcion [1/2]: ').strip() == '2' else '--mmu3'
     if modo == '--indx8': modo_indx8()
-    global FISICO
-    if '--fisico' in args: FISICO = True; args.remove('--fisico')
-    elif '--normal' in args: args.remove('--normal')
-    else:
-        print('Elige el modo de color:\n  1) Normal  (figuras: superficies lisas y uniformes)\n  2) Fisico  (bustos y torsos: conserva musculos, sombras y pezones)')
-        try: FISICO = input('Opcion [1/2]: ').strip() == '2'
-        except EOFError: FISICO = False          # sin teclado (pruebas automaticas): modo Normal
     print(f'Modo: {MODO["nombre"]}')
     altura = None
     if args and args[-1].replace('.', '', 1).isdigit(): altura = float(args.pop())

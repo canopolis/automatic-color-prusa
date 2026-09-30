@@ -1,4 +1,5 @@
 # FullSpectrumPrusa
+Version aprobada: modo Normal con la cara y la limpieza de manchas aprobadas (sin modo Fisico ni cambios posteriores).
 Arrastra un .obj full spectrum (con su .mtl y textura) sobre FullSpectrumPrusa.exe y elige:
 1) Prusa MMU3  - C M Y W K + 105 virtuales ColorMix
 2) Prusa INDX 8 - C M Y W K + Gold Glitter + Silver Glitter + 105 virtuales
