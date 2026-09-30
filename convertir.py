@@ -529,14 +529,16 @@ def main():
         if f in args: modo = f; args.remove(f)
     if modo is None:
         print('Elige la impresora:\n  1) Prusa MMU3  (5 filamentos)\n  2) Prusa INDX 8 (7 cabezales: C M Y W K + Gold + Silver)')
-        modo = '--indx8' if input('Opcion [1/2]: ').strip() == '2' else '--mmu3'
+        try: modo = '--indx8' if input('Opcion [1/2]: ').strip() == '2' else '--mmu3'
+        except EOFError: modo = '--mmu3'
     if modo == '--indx8': modo_indx8()
     global FISICO
     if '--fisico' in args: FISICO = True; args.remove('--fisico')
     elif '--normal' in args: args.remove('--normal')
     else:
         print('Elige el modo de color:\n  1) Normal  (figuras: superficies lisas y uniformes)\n  2) Fisico  (bustos y torsos: conserva musculos, sombras y pezones)')
-        FISICO = input('Opcion [1/2]: ').strip() == '2'
+        try: FISICO = input('Opcion [1/2]: ').strip() == '2'
+        except EOFError: FISICO = False          # sin teclado (pruebas automaticas): modo Normal
     print(f'Modo: {MODO["nombre"]}')
     altura = None
     if args and args[-1].replace('.', '', 1).isdigit(): altura = float(args.pop())
