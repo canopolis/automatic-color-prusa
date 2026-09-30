@@ -27,9 +27,10 @@ jobs:
         shell: pwsh
         run: |
           python pruebas/generar.py
-          python convertir.py --mmu3 pruebas/modelo/esfera.obj 60
+          python convertir.py --mmu3 --normal pruebas/modelo/esfera.obj 60
+          python convertir.py --mmu3 --fisico pruebas/modelo/esfera.obj 60
           $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
-          python convertir.py --indx8 pruebas/modelo/esfera.obj 60
+          python convertir.py --indx8 --normal pruebas/modelo/esfera.obj 60
           python pruebas/verificar.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item -Force plantilla_indx8.config
@@ -40,10 +41,12 @@ jobs:
         run: |
           Remove-Item -Recurse -Force pruebas/modelo
           python pruebas/generar.py
-          ./dist/FullSpectrumPrusa.exe --mmu3 pruebas/modelo/esfera.obj 60
+          ./dist/FullSpectrumPrusa.exe --mmu3 --normal pruebas/modelo/esfera.obj 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./dist/FullSpectrumPrusa.exe --mmu3 --fisico pruebas/modelo/esfera.obj 60
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
-          ./dist/FullSpectrumPrusa.exe --indx8 pruebas/modelo/esfera.obj 60
+          ./dist/FullSpectrumPrusa.exe --indx8 --normal pruebas/modelo/esfera.obj 60
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python pruebas/verificar.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
