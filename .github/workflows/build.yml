@@ -22,7 +22,7 @@ jobs:
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pillow pyinstaller
+          pip install numpy scipy pillow pyinstaller
       - name: Prueba del script (MMU3 e INDX 8)
         shell: pwsh
         run: |
@@ -34,7 +34,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item -Force plantilla_indx8.config
       - name: Compilar exe
-        run: pyinstaller --onefile --console --name FullSpectrumPrusa --icon icono.ico --add-data "plantilla_Slic3r_PE.config;." convertir.py
+        run: pyinstaller --onefile --console --name FullSpectrumPrusa --icon icono.ico --add-data "plantilla_Slic3r_PE.config;." --collect-submodules scipy.sparse.csgraph convertir.py
       - name: Prueba del exe (MMU3 e INDX 8)
         shell: pwsh
         run: |
