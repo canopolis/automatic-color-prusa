@@ -1,0 +1,56 @@
+name: Compilar FullSpectrumPrusa.exe
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SIN_PAUSA: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pillow pyinstaller
+      - name: Prueba del script (MMU3 e INDX 8)
+        shell: pwsh
+        run: |
+          python pruebas/generar.py
+          python convertir.py --mmu3 pruebas/modelo/esfera.obj 60
+          $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
+          python convertir.py --indx8 pruebas/modelo/esfera.obj 60
+          python pruebas/verificar.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item -Force plantilla_indx8.config
+      - name: Compilar exe
+        run: pyinstaller --onefile --console --name FullSpectrumPrusa --icon icono.ico --add-data "plantilla_Slic3r_PE.config;." convertir.py
+      - name: Prueba del exe (MMU3 e INDX 8)
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force pruebas/modelo
+          python pruebas/generar.py
+          ./dist/FullSpectrumPrusa.exe --mmu3 pruebas/modelo/esfera.obj 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
+          ./dist/FullSpectrumPrusa.exe --indx8 pruebas/modelo/esfera.obj 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python pruebas/verificar.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item -Force dist/plantilla_indx8.config -ErrorAction SilentlyContinue
+      - name: Publicar exe en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: FullSpectrumPrusa build ${{ github.run_number }}
+          files: dist/FullSpectrumPrusa.exe
