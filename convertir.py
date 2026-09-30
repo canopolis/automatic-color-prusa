@@ -10,9 +10,23 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from PIL import Image
 
-ALTURA_MM = 100.0      # altura de impresion si el modelo viene sin escala real
+ALTURA_MM = 150.0      # altura de impresion si el modelo viene sin escala real o no cabe en la Core One
 CELDA_MM = 0.4         # escala de suavizado del color (ancho de boquilla)
 SUAVIZADO_MM = 0.8     # radio de suavizado del color sobre la superficie
+UNIFORME_MM2 = 2000.0  # zonas de hasta este tamano se funden si el vecino tiene casi el mismo tono
+UNIFORME_DE = 10.0     # 'casi el mismo tono' (dE); detalles con mas diferencia se conservan
+PROTEGER_FRAC = 0.3    # fraccion minima de detalle para que una zona se considere detalle
+DETALLE_DE = 12.0      # contraste local del original que marca 'detalle' (se protege)
+SUAVIZADO_PIEL_MM = 2.5 # suavizado fuera de la cara/rasgos: piel y telas lisas quedan uniformes
+RASGO_DE = 25.0        # contraste fuerte que define un rasgo (ojo, ceja, labio)
+RASGO_MIN_MM2 = 1.0    # rasgos menores que esto son ruido de textura, no se protegen
+RASGO_MAX_MM2 = 150.0  # detalles de hasta este tamano (ojos, labios, cejas) se protegen
+CARA_RADIO_MM = 12.0   # rasgos a menos de esta distancia entre si forman una cara
+CARA_MIN_RASGOS = 2    # minimo de rasgos vecinos para considerarlo cara
+RASGO_MARGEN_MM = 9.0  # margen protegido alrededor de esos rasgos (cubre la cara)
+ZONA_CLASES = 24       # numero de familias de color para agrupar superficies lisas
+ZONA_TOL = 12.0        # una cara solo toma el tono de su zona si se parece a su propio color
+ZONA_MIN_MM2 = 30.0    # superficies lisas desde este tamano se pintan de un solo tono
 ISLA_MIN_MM2 = 2.0     # zonas de color mas pequenas que esto se funden con su vecina
 N_VIRTUALES = 105
 PASO_RATIO = 0.05
@@ -206,7 +220,7 @@ def mayoria(idx, N, pasadas=4):
         idx = cand
     return idx
 
-def quitar_islas(idx, N, area, min_area, rondas=40, Lref=None, PL=None, tol=10.0):
+def quitar_islas(idx, N, area, min_area, rondas=40, Lref=None, PL=None, tol=10.0, proteger=None):
     """funde cada zona de color menor que min_area con el color vecino con el que comparte mas borde"""
     n = len(idx); r = np.repeat(np.arange(n), 3); c = N.ravel(); val = c >= 0; r, c = r[val], c[val]
     for _ in range(rondas):
@@ -232,6 +246,9 @@ def quitar_islas(idx, N, area, min_area, rondas=40, Lref=None, PL=None, tol=10.0
             media = np.stack([np.bincount(comp, weights=Lref[:, j], minlength=nc) for j in range(3)], 1) / np.maximum(cnt_c, 1)[:, None]
             dist = np.linalg.norm(media - PL[np.maximum(nuevo, 0)], axis=1)
             cambia &= dist < tol                   # detalle real (ojo, labio, borde) -> se conserva
+        if proteger is not None:
+            frac = np.bincount(comp, weights=area * proteger, minlength=nc) / np.maximum(a, 1e-9)
+            cambia &= frac < PROTEGER_FRAC      # zona que ES detalle (ojo, labio) se conserva; un parche que solo roza un borde, no
         f = cambia[comp]; idx = idx.copy(); idx[f] = nuevo[comp[f]]
     return idx
 
@@ -292,16 +309,25 @@ def escribir_3mf(out, nombre, V, F, estados, WV, PV, miniatura):
 
 # ---------------- render de vista previa ----------------
 def render(V, F, fcol, size=600):
+    """vista previa sin huecos: cada triangulo se muestrea segun su tamano en pantalla"""
     P = V[:, [0, 2, 1]] * np.array([1, 1, -1])           # frente: X derecha, Z arriba, -Y hacia camara
     N = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]); N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
     lo = P[:, :2].min(0); hi = P[:, :2].max(0); sc = (size - 20) / (hi - lo).max()
     fi = np.where(N[:, 2] > 0)[0]; c = fcol[fi] * np.clip(0.35 + 0.65 * N[fi, 2], 0, 1)[:, None]
-    img = np.ones((size, size, 3)); zb = np.full(size * size, -1e9)
-    for w in [[1/3,1/3,1/3],[.6,.2,.2],[.2,.6,.2],[.2,.2,.6]]:
-        p = w[0] * P[F[fi, 0]] + w[1] * P[F[fi, 1]] + w[2] * P[F[fi, 2]]
-        x = ((p[:, 0] - lo[0]) * sc + 10).astype(int); y = (size - 1 - ((p[:, 1] - lo[1]) * sc + 10)).astype(int)
-        pix = y * size + x; z = p[:, 2]; o = np.lexsort((-z, pix)); pu, first = np.unique(pix[o], return_index=True); sel = o[first]
-        u = z[sel] > zb[pu]; zb[pu[u]] = z[sel][u]; img.reshape(-1, 3)[pu[u]] = c[sel][u]
+    A, B, C = P[F[fi, 0]], P[F[fi, 1]], P[F[fi, 2]]
+    lado = np.max([np.linalg.norm((B - A)[:, :2], axis=1), np.linalg.norm((C - B)[:, :2], axis=1),
+                   np.linalg.norm((A - C)[:, :2], axis=1)], axis=0) * sc
+    k_f = np.clip(np.ceil(lado * 1.5).astype(int), 1, 40)
+    img = np.ones((size, size, 3)); zb = np.full(size * size, -1e9); flat = img.reshape(-1, 3)
+    for k in np.unique(k_f):
+        g = np.nonzero(k_f == k)[0]
+        pts = [(i / k, j / k) for i in range(k + 1) for j in range(k + 1 - i)] if k > 1 else [(1/3, 1/3)]
+        for u_, v_ in pts:
+            p = A[g] + u_ * (B[g] - A[g]) + v_ * (C[g] - A[g])
+            x = np.clip(((p[:, 0] - lo[0]) * sc + 10).astype(int), 0, size - 1)
+            y = np.clip((size - 1 - ((p[:, 1] - lo[1]) * sc + 10)).astype(int), 0, size - 1)
+            pix = y * size + x; z = p[:, 2]; o = np.lexsort((-z, pix)); pu, first = np.unique(pix[o], return_index=True); sel = o[first]
+            upd = z[sel] > zb[pu]; zb[pu[upd]] = z[sel][upd]; flat[pu[upd]] = c[g][sel][upd]
     return Image.fromarray((img * 255).astype(np.uint8))
 
 ULTIMO = {}
@@ -314,7 +340,8 @@ def convertir(path, altura):
     # OBJ (Y arriba) -> 3MF (Z arriba), escala y centrado en cama
     V = V @ np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
     alto = V[:, 2].max() - V[:, 2].min()
-    if alto < 20 or altura: V = V * ((altura or ALTURA_MM) / alto)
+    # sin escala real o mas alto que la Core One -> se escala a la altura de impresion
+    if alto < 20 or alto > 270 or altura: V = V * ((altura or ALTURA_MM) / alto)
     V = V - [(V[:, 0].max() + V[:, 0].min()) / 2 - BED[0], (V[:, 1].max() + V[:, 1].min()) / 2 - BED[1], V[:, 2].min()]
     # color por cara, suavizado a escala de boquilla
     if tex is not None:
@@ -341,17 +368,77 @@ def convertir(path, altura):
     nu = len(MODO['usables']); nf = len(MODO['fisicos'])
     id_de = np.array([u + 1 for u in MODO['usables']] + [nf + 1 + k for k in range(len(PV))])
     print('Asignando colores (suavizado + limpieza de manchas) ...')
-    N = vecinos(FV)
+    # vecindad por posicion: el OBJ duplica vertices en las costuras de la textura (UV); sin soldarlos,
+    # cada isla de textura quedaba como una zona aparte y recibia su propio tono -> parches
+    _, soldado = np.unique(np.round(V, 4), axis=0, return_inverse=True)
+    N = vecinos(soldado.ravel()[FV])
     area = 0.5 * np.linalg.norm(np.cross(V[FV[:, 1]] - V[FV[:, 0]], V[FV[:, 2]] - V[FV[:, 0]]), axis=1)
     lado = np.sqrt(2 * np.median(area)); pasos = int(np.clip((SUAVIZADO_MM / max(lado, 1e-6)) ** 2, 1, 60))
+    # mascara de detalle: lo que se aparta de su entorno en el original (ojos, cejas, labios, lineas finas)
+    Lo = lab(col_orig); okN = N >= 0; Nn = np.where(okN, N, 0)
+    entorno = suavizar(Lo, N, max(3, pasos // 2), sigma=1e6)
+    detalle = np.linalg.norm(Lo - entorno, axis=1) > DETALLE_DE
+    for _ in range(3): detalle = detalle | (detalle[Nn] & okN).any(1)
+    # zona protegida = rasgos pequenos (ojos, labios, cejas...) y su entorno: la cara queda tal cual.
+    # los bordes largos (bikini, costuras) no se protegen: su contraste ya impide que se mezclen.
+    dif = np.linalg.norm(Lo - entorno, axis=1)
+    rasgo = dif > RASGO_DE
+    for _ in range(2): rasgo = rasgo | (rasgo[Nn] & okN).any(1)
+    r = np.repeat(np.arange(len(FV)), 3); c = N.ravel(); cv = np.where(c >= 0, c, 0)
+    m = (c >= 0) & rasgo[r] & rasgo[cv]
+    nc, compd = connected_components(coo_matrix((np.ones(m.sum()), (r[m], c[m])), shape=(len(FV),) * 2), directed=False)
+    a_d = np.bincount(compd, weights=area * rasgo, minlength=nc)
+    rasgo_ok = rasgo & (a_d[compd] >= RASGO_MIN_MM2) & (a_d[compd] < RASGO_MAX_MM2)
+    # la cara = grupo de varios rasgos juntos (ojos, cejas, nariz, boca). Solo ahi se usa el margen amplio;
+    # rasgos sueltos del cuerpo (adornos, bordes del cuello) solo protegen su propio contorno.
+    ids = np.unique(compd[rasgo_ok]); cen = V[FV].mean(1)
+    cc_ = np.stack([np.bincount(compd[rasgo_ok], weights=cen[rasgo_ok, j], minlength=nc)[ids] for j in range(3)], 1) / \
+          np.bincount(compd[rasgo_ok], minlength=nc)[ids][:, None]
+    vecin = (np.linalg.norm(cc_[:, None] - cc_[None], axis=2) < CARA_RADIO_MM).sum(1) - 1 if len(ids) else np.zeros(0)
+    cara = np.zeros(len(FV), bool)
+    if len(ids) and vecin.max() >= CARA_MIN_RASGOS:
+        # la cara es el grupo mas denso de rasgos; se protege una esfera alrededor de su centro
+        centro = cc_[vecin == vecin.max()].mean(0)
+        sel = np.linalg.norm(cc_ - centro, axis=1) < CARA_RADIO_MM
+        pts = cc_[sel]; rad = np.linalg.norm(pts - centro, axis=1).max() + RASGO_MARGEN_MM
+        cara = np.linalg.norm(cen - centro, axis=1) < rad
+    proteger = rasgo_ok | cara
+    for _ in range(3): proteger = proteger | (proteger[Nn] & okN).any(1)
+    # color: zona protegida igual que antes (nitido en el detalle); resto con suavizado fuerte y uniforme
     Lc = suavizar(lab(col), N, pasos)
+    Lc[detalle & proteger] = suavizar(Lo, N, 1, sigma=6.0)[detalle & proteger]
+    pasos_piel = int(np.clip((SUAVIZADO_PIEL_MM / max(lado, 1e-6)) ** 2, pasos, 200))
+    Lp = suavizar(Lc, N, pasos_piel - pasos, sigma=8.0) if pasos_piel > pasos else Lc
+    Lc = np.where(proteger[:, None], Lc, Lp)
     Wp = np.vstack([np.eye(5)[MODO['usables']], WV])
     idx = np.empty(len(Lc), int)
     for s0 in range(0, len(Lc), 100000):
         blk = Lc[s0:s0 + 100000]
         idx[s0:s0 + 100000] = (dist(blk, PL) + penal_piel(blk, Wp)).argmin(1)
-    idx = mayoria(idx, N)
-    idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL)
+    idx = np.where(proteger, idx, mayoria(idx, N))
+    # superficies lisas: se agrupan por continuidad de color y cada zona grande recibe UN solo tono (sin parches)
+    # clases de color gruesas (k-medias): la piel es una clase, el traje otra... no se encadenan entre si
+    rng = np.random.default_rng(2); smp = Lc[rng.choice(len(Lc), min(60000, len(Lc)), replace=False)]
+    cen = smp[rng.choice(len(smp), ZONA_CLASES, replace=False)]
+    for _ in range(15):
+        a_ = dist(smp, cen).argmin(1)
+        for k in range(ZONA_CLASES):
+            if (a_ == k).any(): cen[k] = smp[a_ == k].mean(0)
+    clase = np.concatenate([dist(Lc[i:i + 200000], cen).argmin(1) for i in range(0, len(Lc), 200000)])
+    cv2 = np.where(c >= 0, c, 0)
+    ok2 = (c >= 0) & ~proteger[r] & ~proteger[cv2] & (clase[r] == clase[cv2])
+    ns, seg = connected_components(coo_matrix((np.ones(ok2.sum()), (r[ok2], c[ok2])), shape=(len(FV),) * 2), directed=False)
+    a_s = np.bincount(seg, weights=area, minlength=ns)
+    med = np.stack([np.bincount(seg, weights=area * Lc[:, j], minlength=ns) for j in range(3)], 1) / np.maximum(a_s, 1e-12)[:, None]
+    grande = (a_s >= ZONA_MIN_MM2)[seg] & ~proteger
+    if grande.any():
+        gs = np.nonzero(a_s >= ZONA_MIN_MM2)[0]
+        tono = np.zeros(ns, int); tono[gs] = (dist(med[gs], PL) + penal_piel(med[gs], Wp)).argmin(1)
+        cerca = np.linalg.norm(Lc - PL[tono[seg]], axis=1) < ZONA_TOL      # nunca pintar una cara con un tono lejano al suyo
+        idx = np.where(grande & cerca, tono[seg], idx)
+    idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL, proteger=detalle & proteger)
+    # uniformidad fuera de la zona protegida: parches de tono parecido se funden (piel, telas lisas)
+    idx = quitar_islas(idx, N, area, UNIFORME_MM2, Lref=Lc, PL=PL, tol=UNIFORME_DE, proteger=proteger)
     if os.environ.get('DEPURAR'): np.savez(os.environ['DEPURAR'], V=V, F=FV, co=col_orig, P=PAL, i=idx)
     estados = id_de[idx]                  # ids de PrusaSlicer: fisicos 1..N, virtuales N+1..
     carpeta = os.path.join(os.path.dirname(path), f'{nombre}_prusa_{MODO["sufijo"]}'); os.makedirs(carpeta, exist_ok=True)
@@ -359,7 +446,7 @@ def convertir(path, altura):
     vp = Image.new('RGB', (1220, 640), 'white'); vp.paste(prev[0], (0, 40)); vp.paste(prev[1], (620, 40))
     from PIL import ImageDraw; d = ImageDraw.Draw(vp); d.text((20, 10), 'Original', fill='black'); d.text((640, 10), f'{MODO["nombre"]} - ColorMix ({len(MODO["usables"])} reales + {len(PV)} virtuales)', fill='black')
     vp.save(os.path.join(carpeta, 'vista_previa.png'))
-    ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx)
+    ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx, prot=proteger, det=detalle, Lc=Lc, clase=clase)
     out = os.path.join(carpeta, f'{nombre}_colormix.3mf')
     print('Escribiendo 3MF ...')
     escribir_3mf(out, nombre, V, FV, estados, WV, PV, prev[1].resize((256, 256)))
