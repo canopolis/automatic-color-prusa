@@ -6,15 +6,19 @@ Uso: arrastrar el .obj sobre el .exe   |   python convertir.py modelo.obj [altur
 """
 import sys, os, json, zipfile, itertools, time, io
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from PIL import Image
 
 ALTURA_MM = 100.0      # altura de impresion si el modelo viene sin escala real
-CELDA_MM = 0.4         # tamano de la trama de color (ancho de boquilla)
+CELDA_MM = 0.4         # escala de suavizado del color (ancho de boquilla)
+SUAVIZADO_MM = 0.8     # radio de suavizado del color sobre la superficie
+ISLA_MIN_MM2 = 2.0     # zonas de color mas pequenas que esto se funden con su vecina
 N_VIRTUALES = 105
 PASO_RATIO = 0.05
 BED = (125.0, 110.0)   # centro de la cama Core One
 # colores fisicos (mismos que el proyecto PrusaSlicer de referencia)
-FISICOS = ['#0080C0', '#DB5182', '#FFFF80', '#FFFFFF', '#000000']   # C M Y W K
+FISICOS = ['#009BC3', '#DB5182', '#FFD100', '#F5F5F5', '#1A1A1A']   # C M Y W K  (Prusament PLA ColorMix)
 A_MEZCLA = 0.0045      # parametro del modelo de mezcla ajustado a los virtuales de PrusaSlicer
 
 # ---- modos de impresora ----
@@ -44,7 +48,7 @@ def modo_indx8():
     fis = [c if c.startswith('#') and len(c) == 7 else '#808080' for c in cols][:7]
     fis[:5] = FISICOS                     # C M Y W K con los mismos valores del modelo de mezcla ajustado
     MODO.update({'nombre': 'Prusa INDX 8', 'plantilla': pl, 'fisicos': fis,
-                 'usables': [0, 1, 2, 3, 4, 5, 6], 'mezcla': [0, 1, 2, 3, 4], 'sufijo': 'indx8'})
+                 'usables': [0, 1, 2, 3, 4], 'mezcla': [0, 1, 2, 3, 4], 'sufijo': 'indx8'})
 
 def linea_cfg(cfg, clave):
     for l in cfg.split('\n'):
@@ -79,18 +83,43 @@ def candidatos():
             for parts in itertools.product(range(1, n), repeat=k):
                 if sum(parts) != n: continue
                 w = np.zeros(5); w[list(comb)] = np.array(parts) / n; out.append(w)
-    W = np.array(out); return W, mezcla(W)
+    for comb in itertools.combinations([0, 1, 2, 4], 2):          # blanco + 1 o 2 colores, paso fino
+        for a in range(0, 16):
+            for b in range(0, 16):
+                if a + b == 0 or a + b > 15: continue
+                w = np.zeros(5); w[3] = 1 - (a + b) * 0.02; w[comb[0]] = a * 0.02; w[comb[1]] = b * 0.02; out.append(w)
+    W = np.unique(np.round(np.array(out), 4), axis=0); return W, mezcla(W)
+
+def dist(A, B):
+    """distancia tipo CIE94 con mas peso al tono: A (n,3) contra B (m,3) en Lab"""
+    dL = A[:, None, 0] - B[None, :, 0]
+    Ca = np.hypot(A[:, 1], A[:, 2]); Cb = np.hypot(B[:, 1], B[:, 2])
+    dC = Ca[:, None] - Cb[None, :]
+    da = A[:, None, 1] - B[None, :, 1]; db = A[:, None, 2] - B[None, :, 2]
+    dH2 = np.maximum(da * da + db * db - dC * dC, 0)
+    wH = 1 + 1.5 * np.clip(Ca / 15, 0, 1)[:, None]          # en colores con tono definido, el tono pesa mas
+    return np.sqrt(dL * dL + dC * dC + wH * wH * dH2).astype(np.float32)
+
+def penal_piel(Lt, Wp):
+    """en tonos claros y calidos (piel, pelo rubio) castiga mezclas con cian o negro, que ensucian"""
+    calido = (Lt[:, 0] > 55) & (Lt[:, 1] > -3) & (Lt[:, 2] > 3)
+    return (calido[:, None] * (40 * Wp[None, :, 0] + 25 * Wp[None, :, 4])).astype(np.float32)
 
 def elegir_paleta(W, rgb, muestras, k):
     """facility location voraz: elige k virtuales que minimizan el error dE sobre los colores del modelo"""
     L = lab(rgb).astype(np.float32); B = lab(base_usable()).astype(np.float32); m = lab(muestras).astype(np.float32)
-    cur = np.linalg.norm(m[:, None] - B[None], axis=2).min(1)
+    cur = dist(m, B).min(1)
     D = np.empty((len(m), len(L)), np.float32)
     for s0 in range(0, len(L), 500):
-        D[:, s0:s0 + 500] = np.linalg.norm(m[:, None] - L[None, s0:s0 + 500], axis=2)
+        D[:, s0:s0 + 500] = dist(m, L[s0:s0 + 500])
+    D += penal_piel(m, W)
+    Bw = np.eye(5)[MODO['usables']]
+    cur = cur + penal_piel(m, Bw).min(1) * 0
+    q = np.round(m / 6).astype(int); _, inv, cnt = np.unique(q, axis=0, return_inverse=True, return_counts=True)
+    peso = 1 / np.sqrt(cnt[inv.ravel()])          # los colores escasos (cara, detalles) pesan mas
     sel = []
     for _ in range(k):
-        g = np.maximum(cur[:, None] - D, 0).sum(0); g[sel] = -1
+        g = (peso[:, None] * np.maximum(cur[:, None] - D, 0)).sum(0); g[sel] = -1
         j = int(g.argmax()); sel.append(j); cur = np.minimum(cur, D[:, j])
     return W[sel], rgb[sel]
 
@@ -144,6 +173,67 @@ def asignar(colores, PL, umbral):
                 m = err < bv; bv[m] = err[m]; bi[m] = o[m, i]; bj[m] = o[m, j]; bt[m] = t[m]
         out[s0:s0 + 40000] = np.where(umbral[s0:s0 + 40000] < bt, bj, bi)
     return out
+
+
+# ---------------- limpieza sobre la malla (sin tramado: evita el efecto "viruela") ----------------
+def vecinos(F):
+    """3 vecinos por cara (por arista compartida); -1 si es borde"""
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]); e.sort(1)
+    fid = np.tile(np.arange(len(F)), 3); lado = np.repeat([0, 1, 2], len(F))
+    k = e[:, 0].astype(np.int64) * (F.max() + 1) + e[:, 1]
+    o = np.argsort(k, kind='stable'); ks = k[o]
+    N = -np.ones((len(F), 3), np.int64)
+    par = np.nonzero(ks[1:] == ks[:-1])[0]
+    a, b = o[par], o[par + 1]
+    N[fid[a], lado[a]] = fid[b]; N[fid[b], lado[b]] = fid[a]
+    return N
+
+def suavizar(Lc, N, pasos, sigma=10.0):
+    """suavizado que respeta bordes: no mezcla colores muy distintos (bikini/piel, ojos, labios)"""
+    X = Lc.copy(); ok = N >= 0; Nn = np.where(ok, N, 0)
+    for _ in range(pasos):
+        d2 = ((X[Nn] - X[:, None]) ** 2).sum(2)
+        w = ok * np.exp(-d2 / (2 * sigma * sigma))
+        X = (X + (X[Nn] * w[..., None]).sum(1)) / (1 + w.sum(1))[:, None]
+    return X
+
+def mayoria(idx, N, pasadas=4):
+    ok = N >= 0; Nn = np.where(ok, N, 0)
+    for _ in range(pasadas):
+        L = np.where(ok, idx[Nn], -1)
+        a, b, c = L[:, 0], L[:, 1], L[:, 2]
+        cand = np.where((a == b) & (a >= 0), a, np.where((b == c) & (b >= 0), b, np.where((a == c) & (a >= 0), a, idx)))
+        idx = cand
+    return idx
+
+def quitar_islas(idx, N, area, min_area, rondas=40, Lref=None, PL=None, tol=10.0):
+    """funde cada zona de color menor que min_area con el color vecino con el que comparte mas borde"""
+    n = len(idx); r = np.repeat(np.arange(n), 3); c = N.ravel(); val = c >= 0; r, c = r[val], c[val]
+    for _ in range(rondas):
+        mism = idx[r] == idx[c]
+        g = coo_matrix((np.ones(mism.sum()), (r[mism], c[mism])), shape=(n, n))
+        nc, comp = connected_components(g, directed=False)
+        a = np.bincount(comp, weights=area, minlength=nc)
+        # procesar primero las mas pequenas: solo zonas bajo el umbral
+        peq = a < min_area
+        if not peq.any(): break
+        borde = (~mism) & peq[comp[r]]
+        cr, lc = comp[r[borde]], idx[c[borde]]
+        if len(cr) == 0: break
+        key = cr.astype(np.int64) * 1000 + lc
+        uk, cnt = np.unique(key, return_counts=True)
+        kc, kl = uk // 1000, uk % 1000
+        o = np.lexsort((-cnt, kc)); kc, kl = kc[o], kl[o]
+        first = np.r_[True, kc[1:] != kc[:-1]]
+        nuevo = np.full(nc, -1); nuevo[kc[first]] = kl[first]
+        cambia = peq & (nuevo >= 0)
+        if Lref is not None:
+            cnt_c = np.bincount(comp, minlength=nc)
+            media = np.stack([np.bincount(comp, weights=Lref[:, j], minlength=nc) for j in range(3)], 1) / np.maximum(cnt_c, 1)[:, None]
+            dist = np.linalg.norm(media - PL[np.maximum(nuevo, 0)], axis=1)
+            cambia &= dist < tol                   # detalle real (ojo, labio, borde) -> se conserva
+        f = cambia[comp]; idx = idx.copy(); idx[f] = nuevo[comp[f]]
+    return idx
 
 # ---------------- 3MF ----------------
 def codigo(estado):
@@ -214,6 +304,7 @@ def render(V, F, fcol, size=600):
         u = z[sel] > zb[pu]; zb[pu[u]] = z[sel][u]; img.reshape(-1, 3)[pu[u]] = c[sel][u]
     return Image.fromarray((img * 255).astype(np.uint8))
 
+ULTIMO = {}
 # ---------------- principal ----------------
 def convertir(path, altura):
     t0 = time.time(); nombre = os.path.splitext(os.path.basename(path))[0]
@@ -244,19 +335,31 @@ def convertir(path, altura):
         print('ERROR: el OBJ no tiene textura ni color por vertice.'); return
     print('Eligiendo 105 virtuales para este modelo ...')
     W, rgb = candidatos()
-    m = col[np.random.default_rng(1).choice(len(col), min(8000, len(col)), replace=False)]
+    m = col[np.random.default_rng(1).choice(len(col), min(12000, len(col)), replace=False)]
     WV, PV = elegir_paleta(W, rgb, m, N_VIRTUALES)
     PAL = np.vstack([base_usable(), PV]); PL = lab(PAL)
     nu = len(MODO['usables']); nf = len(MODO['fisicos'])
     id_de = np.array([u + 1 for u in MODO['usables']] + [nf + 1 + k for k in range(len(PV))])
-    print('Asignando colores con tramado ...')
-    idx = asignar(col, PL, umbral)
+    print('Asignando colores (suavizado + limpieza de manchas) ...')
+    N = vecinos(FV)
+    area = 0.5 * np.linalg.norm(np.cross(V[FV[:, 1]] - V[FV[:, 0]], V[FV[:, 2]] - V[FV[:, 0]]), axis=1)
+    lado = np.sqrt(2 * np.median(area)); pasos = int(np.clip((SUAVIZADO_MM / max(lado, 1e-6)) ** 2, 1, 60))
+    Lc = suavizar(lab(col), N, pasos)
+    Wp = np.vstack([np.eye(5)[MODO['usables']], WV])
+    idx = np.empty(len(Lc), int)
+    for s0 in range(0, len(Lc), 100000):
+        blk = Lc[s0:s0 + 100000]
+        idx[s0:s0 + 100000] = (dist(blk, PL) + penal_piel(blk, Wp)).argmin(1)
+    idx = mayoria(idx, N)
+    idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL)
+    if os.environ.get('DEPURAR'): np.savez(os.environ['DEPURAR'], V=V, F=FV, co=col_orig, P=PAL, i=idx)
     estados = id_de[idx]                  # ids de PrusaSlicer: fisicos 1..N, virtuales N+1..
     carpeta = os.path.join(os.path.dirname(path), f'{nombre}_prusa_{MODO["sufijo"]}'); os.makedirs(carpeta, exist_ok=True)
     prev = [render(V, FV, col_orig), render(V, FV, PAL[idx])]
     vp = Image.new('RGB', (1220, 640), 'white'); vp.paste(prev[0], (0, 40)); vp.paste(prev[1], (620, 40))
     from PIL import ImageDraw; d = ImageDraw.Draw(vp); d.text((20, 10), 'Original', fill='black'); d.text((640, 10), f'{MODO["nombre"]} - ColorMix ({len(MODO["usables"])} reales + {len(PV)} virtuales)', fill='black')
     vp.save(os.path.join(carpeta, 'vista_previa.png'))
+    ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx)
     out = os.path.join(carpeta, f'{nombre}_colormix.3mf')
     print('Escribiendo 3MF ...')
     escribir_3mf(out, nombre, V, FV, estados, WV, PV, prev[1].resize((256, 256)))
