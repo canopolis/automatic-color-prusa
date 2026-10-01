@@ -19,6 +19,8 @@ PROTEGER_FRAC = 0.3    # fraccion minima de detalle para que una zona se conside
 DETALLE_DE = 12.0      # contraste local del original que marca 'detalle' (se protege)
 SUAVIZADO_PIEL_MM = 2.5 # suavizado fuera de la cara/rasgos: piel y telas lisas quedan uniformes
 RASGO_DE = 25.0        # contraste fuerte que define un rasgo (ojo, ceja, labio)
+RASGO_DE_2 = 20.0      # segundo intento si no se encontro cara
+RASGO_MIN_MM2_2 = 0.3  # segundo intento si no se encontro cara
 RASGO_MIN_MM2 = 1.0    # rasgos menores que esto son ruido de textura, no se protegen
 RASGO_MAX_MM2 = 150.0  # detalles de hasta este tamano (ojos, labios, cejas) se protegen
 CARA_RADIO_MM = 12.0   # rasgos a menos de esta distancia entre si forman una cara
@@ -137,6 +139,100 @@ def elegir_paleta(W, rgb, muestras, k):
         j = int(g.argmax()); sel.append(j); cur = np.minimum(cur, D[:, j])
     return W[sel], rgb[sel]
 
+# ---------------- GLB / GLTF ----------------
+def _matriz_nodo(n):
+    if 'matrix' in n: return np.array(n['matrix'], float).reshape(4, 4).T
+    M = np.eye(4)
+    t = n.get('translation', [0, 0, 0]); q = n.get('rotation', [0, 0, 0, 1]); sc = n.get('scale', [1, 1, 1])
+    x, y, z, w = q
+    R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    M[:3, :3] = R * np.array(sc)[None, :]; M[:3, 3] = t
+    return M
+
+def cargar_glb(path):
+    """lee modelos .glb / .gltf (los que entregan los generadores 3D con IA): geometria, UV, textura o colores"""
+    import json, struct, base64, tempfile
+    datos = open(path, 'rb').read(); base = os.path.dirname(path)
+    binarios = {}
+    if datos[:4] == b'glTF':
+        off = 12; js = None
+        while off + 8 <= len(datos):
+            ln, typ = struct.unpack_from('<I4s', datos, off); off += 8
+            ch = datos[off:off + ln]; off += ln
+            if typ == b'JSON': js = json.loads(ch.decode('utf-8'))
+            elif typ == b'BIN\x00': binarios[0] = ch
+    else:
+        js = json.loads(datos.decode('utf-8'))
+    if js is None: raise SystemExit('ERROR: el archivo no es un GLB/GLTF valido.')
+    if 'KHR_draco_mesh_compression' in js.get('extensionsUsed', []) or 'EXT_meshopt_compression' in js.get('extensionsUsed', []):
+        raise SystemExit('ERROR: este GLB tiene la geometria comprimida (Draco/meshopt). Exportalo sin compresion o como OBJ.')
+    def buffer(i):
+        if i not in binarios:
+            uri = js['buffers'][i].get('uri', '')
+            binarios[i] = base64.b64decode(uri.split(',', 1)[1]) if uri.startswith('data:') else open(os.path.join(base, uri), 'rb').read()
+        return binarios[i]
+    tipos = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16, 5125: np.uint32, 5126: np.float32}
+    comps = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
+    def acc(i):
+        a = js['accessors'][i]; bv = js['bufferViews'][a['bufferView']]
+        dt = np.dtype(tipos[a['componentType']]); n = comps[a['type']]
+        buf = buffer(bv.get('buffer', 0)); ini = bv.get('byteOffset', 0) + a.get('byteOffset', 0)
+        paso = bv.get('byteStride', 0) or dt.itemsize * n
+        arr = np.ndarray((a['count'], n), dtype=dt, buffer=buf, offset=ini, strides=(paso, dt.itemsize)).astype(float)
+        if a.get('normalized') and dt.kind in 'iu':
+            arr = arr / float(np.iinfo(dt).max)
+        return arr
+    def imagen(ii):
+        im = js['images'][ii]
+        if 'bufferView' in im:
+            bv = js['bufferViews'][im['bufferView']]; b = buffer(bv.get('buffer', 0))
+            return b[bv.get('byteOffset', 0): bv.get('byteOffset', 0) + bv['byteLength']]
+        uri = im.get('uri', '')
+        return base64.b64decode(uri.split(',', 1)[1]) if uri.startswith('data:') else open(os.path.join(base, uri), 'rb').read()
+    # matrices de cada malla segun la jerarquia de nodos
+    mallas = []
+    escena = js.get('scenes', [{}])[js.get('scene', 0)] if js.get('scenes') else {'nodes': list(range(len(js.get('nodes', []))))}
+    def visitar(ni, M):
+        n = js['nodes'][ni]; M2 = M @ _matriz_nodo(n)
+        if 'mesh' in n: mallas.append((n['mesh'], M2))
+        for h in n.get('children', []): visitar(h, M2)
+    for ni in escena.get('nodes', []): visitar(ni, np.eye(4))
+    if not mallas: mallas = [(i, np.eye(4)) for i in range(len(js.get('meshes', [])))]
+    Vs, Ts, Cs, Fs, imgs = [], [], [], [], []; base_v = 0; hay_uv = False
+    for mi, M in mallas:
+        for pr in js['meshes'][mi]['primitives']:
+            if pr.get('mode', 4) != 4: continue
+            at = pr['attributes']; P = acc(at['POSITION'])
+            P = (np.c_[P, np.ones(len(P))] @ M.T)[:, :3]
+            idx = acc(pr['indices']).astype(np.int64).ravel() if 'indices' in pr else np.arange(len(P))
+            F = idx.reshape(-1, 3) + base_v
+            mat = js.get('materials', [{}])[pr['material']] if 'material' in pr else {}
+            pbr = mat.get('pbrMetallicRoughness', {}); fac = np.array(pbr.get('baseColorFactor', [1, 1, 1, 1]))[:3]
+            tx = pbr.get('baseColorTexture')
+            if tx is not None and 'TEXCOORD_0' in at:
+                src = js['textures'][tx['index']]['source']
+                if src not in imgs: imgs.append(src)
+                uv = acc(at['TEXCOORD_0'])[:, :2].copy(); uv[:, 1] = 1 - uv[:, 1]; hay_uv = True
+            else:
+                uv = np.zeros((len(P), 2))
+            if 'COLOR_0' in at: col_v = acc(at['COLOR_0'])[:, :3] * fac
+            else: col_v = np.tile(fac, (len(P), 1))
+            Vs.append(P); Ts.append(uv); Cs.append(col_v); Fs.append(F); base_v += len(P)
+    if not Vs: raise SystemExit('ERROR: el GLB no contiene mallas de triangulos.')
+    if len(imgs) > 1:
+        raise SystemExit('ERROR: este GLB usa varias texturas distintas. Exportalo como OBJ con una sola textura.')
+    V = np.vstack(Vs); FV = np.vstack(Fs)
+    tex = None; T = None; VC = None
+    if hay_uv:
+        T = np.vstack(Ts); fuera = (T < 0) | (T > 1); T = np.where(fuera, T - np.floor(T), T)
+        d = tempfile.mkdtemp(prefix='fsp_'); tex = os.path.join(d, 'textura_glb.png')
+        Image.open(io.BytesIO(imagen(imgs[0]))).convert('RGB').save(tex)
+    else:
+        VC = np.vstack(Cs)
+    return V, VC, T, FV, FV.copy(), tex
+
 # ---------------- OBJ ----------------
 def cargar_obj(path):
     with open(path, 'r', errors='ignore') as fh: lines = fh.read().split('\n')
@@ -166,6 +262,11 @@ def cargar_obj(path):
                 if p and p[0].lower() == 'map_kd':
                     img = os.path.join(os.path.dirname(path), p[1].strip().replace('\\', '/').split('/')[-1])
                     if os.path.exists(img): tex = img
+    if T is not None:
+        # algunos exportadores (p. ej. 3dviewer.net) guardan la coordenada V negativa (-1..0);
+        # se aplica la repeticion estandar de textura para que caiga dentro de 0..1 (los modelos normales no cambian)
+        fuera = (T < 0) | (T > 1)
+        T = np.where(fuera, T - np.floor(T), T)
     return V, VC, T, FV, FT, tex
 
 # ---------------- tramado ----------------
@@ -341,9 +442,10 @@ def print(*a, **k):
 class Progreso:
     """muestra el paso actual, una barra y un contador de segundos para que se vea que el programa sigue trabajando"""
     TOTAL = 12
+    todos = []
     def __init__(self):
         self.t0 = time.time(); self.n = 0; self.txt = ''; self.ts = time.time()
-        self.activo = True; threading.Thread(target=self._latido, daemon=True).start()
+        Progreso.todos.append(self); self.activo = True; threading.Thread(target=self._latido, daemon=True).start()
     def paso(self, texto):
         self.n += 1; self.txt = texto; self.ts = time.time()
         pct = int(100 * (self.n - 1) / self.TOTAL); barra = '#' * (pct // 5) + '-' * (20 - pct // 5)
@@ -364,7 +466,13 @@ def convertir(path, altura):
     PR = Progreso()
     PR.paso('Leyendo el modelo OBJ (los archivos grandes tardan un poco)')
     print(f'Cargando {path} ...')
-    V, VC, T, FV, FT, tex = cargar_obj(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.glb', '.gltf'):
+        V, VC, T, FV, FT, tex = cargar_glb(path)
+    elif ext == '.obj':
+        V, VC, T, FV, FT, tex = cargar_obj(path)
+    else:
+        raise SystemExit(f'ERROR: formato no soportado ({ext}). Usa un archivo .obj, .glb o .gltf.')
     print(f'  {len(FV):,} triangulos | textura: {os.path.basename(tex) if tex else "no"} | color por vertice: {"si" if VC is not None else "no"}')
     # OBJ (Y arriba) -> 3MF (Z arriba), escala y centrado en cama
     V = V @ np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
@@ -414,26 +522,30 @@ def convertir(path, altura):
     # zona protegida = rasgos pequenos (ojos, labios, cejas...) y su entorno: la cara queda tal cual.
     # los bordes largos (bikini, costuras) no se protegen: su contraste ya impide que se mezclen.
     dif = np.linalg.norm(Lo - entorno, axis=1)
-    rasgo = dif > RASGO_DE
-    for _ in range(2): rasgo = rasgo | (rasgo[Nn] & okN).any(1)
-    r = np.repeat(np.arange(len(FV)), 3); c = N.ravel(); cv = np.where(c >= 0, c, 0)
-    m = (c >= 0) & rasgo[r] & rasgo[cv]
-    nc, compd = connected_components(coo_matrix((np.ones(m.sum()), (r[m], c[m])), shape=(len(FV),) * 2), directed=False)
-    a_d = np.bincount(compd, weights=area * rasgo, minlength=nc)
-    rasgo_ok = rasgo & (a_d[compd] >= RASGO_MIN_MM2) & (a_d[compd] < RASGO_MAX_MM2)
-    # la cara = grupo de varios rasgos juntos (ojos, cejas, nariz, boca). Solo ahi se usa el margen amplio;
-    # rasgos sueltos del cuerpo (adornos, bordes del cuello) solo protegen su propio contorno.
-    ids = np.unique(compd[rasgo_ok]); cen = V[FV].mean(1)
-    cc_ = np.stack([np.bincount(compd[rasgo_ok], weights=cen[rasgo_ok, j], minlength=nc)[ids] for j in range(3)], 1) / \
-          np.bincount(compd[rasgo_ok], minlength=nc)[ids][:, None]
-    vecin = (np.linalg.norm(cc_[:, None] - cc_[None], axis=2) < CARA_RADIO_MM).sum(1) - 1 if len(ids) else np.zeros(0)
-    cara = np.zeros(len(FV), bool)
-    if len(ids) and vecin.max() >= CARA_MIN_RASGOS:
-        # la cara es el grupo mas denso de rasgos; se protege una esfera alrededor de su centro
-        centro = cc_[vecin == vecin.max()].mean(0)
-        sel = np.linalg.norm(cc_ - centro, axis=1) < CARA_RADIO_MM
-        pts = cc_[sel]; rad = np.linalg.norm(pts - centro, axis=1).max() + RASGO_MARGEN_MM
-        cara = np.linalg.norm(cen - centro, axis=1) < rad
+    # deteccion de la cara: primero con los valores aprobados; si no encuentra ninguna cara
+    # (figura pequena o rasgos pintados finos), se repite una vez con valores mas sensibles
+    for _de, _amin in ((RASGO_DE, RASGO_MIN_MM2), (RASGO_DE_2, RASGO_MIN_MM2_2)):
+        rasgo = dif > _de
+        for _ in range(2): rasgo = rasgo | (rasgo[Nn] & okN).any(1)
+        r = np.repeat(np.arange(len(FV)), 3); c = N.ravel(); cv = np.where(c >= 0, c, 0)
+        m = (c >= 0) & rasgo[r] & rasgo[cv]
+        nc, compd = connected_components(coo_matrix((np.ones(m.sum()), (r[m], c[m])), shape=(len(FV),) * 2), directed=False)
+        a_d = np.bincount(compd, weights=area * rasgo, minlength=nc)
+        rasgo_ok = rasgo & (a_d[compd] >= _amin) & (a_d[compd] < RASGO_MAX_MM2)
+        # la cara = grupo de varios rasgos juntos (ojos, cejas, nariz, boca). Solo ahi se usa el margen amplio;
+        # rasgos sueltos del cuerpo (adornos, bordes del cuello) solo protegen su propio contorno.
+        ids = np.unique(compd[rasgo_ok]); cen = V[FV].mean(1)
+        cc_ = np.stack([np.bincount(compd[rasgo_ok], weights=cen[rasgo_ok, j], minlength=nc)[ids] for j in range(3)], 1) / \
+              np.bincount(compd[rasgo_ok], minlength=nc)[ids][:, None]
+        vecin = (np.linalg.norm(cc_[:, None] - cc_[None], axis=2) < CARA_RADIO_MM).sum(1) - 1 if len(ids) else np.zeros(0)
+        cara = np.zeros(len(FV), bool)
+        if len(ids) and vecin.max() >= CARA_MIN_RASGOS:
+            # la cara es el grupo mas denso de rasgos; se protege una esfera alrededor de su centro
+            centro = cc_[vecin == vecin.max()].mean(0)
+            sel = np.linalg.norm(cc_ - centro, axis=1) < CARA_RADIO_MM
+            pts = cc_[sel]; rad = np.linalg.norm(pts - centro, axis=1).max() + RASGO_MARGEN_MM
+            cara = np.linalg.norm(cen - centro, axis=1) < rad
+        if cara.any(): break
     proteger = rasgo_ok | cara
     for _ in range(3): proteger = proteger | (proteger[Nn] & okN).any(1)
     # color: zona protegida igual que antes (nitido en el detalle); resto con suavizado fuerte y uniforme
@@ -506,11 +618,15 @@ def main():
     print(f'Modo: {MODO["nombre"]}')
     altura = None
     if args and args[-1].replace('.', '', 1).isdigit(): altura = float(args.pop())
-    if not args: args = [input('Arrastra aqui el .obj y pulsa Enter: ').strip().strip('"')]
+    if not args: args = [input('Arrastra aqui el .obj o .glb y pulsa Enter: ').strip().strip('"')]
     ok = True
     for a in args:
         try: convertir(os.path.abspath(a), altura)
+        except SystemExit as e:
+            for pr_ in Progreso.todos: pr_.activo = False
+            print(f'\n{e}'); ok = False
         except Exception:
+            for pr_ in Progreso.todos: pr_.activo = False
             import traceback; traceback.print_exc(); ok = False
     if not os.environ.get('SIN_PAUSA'): input('\nListo. Pulsa Enter para cerrar...')
     return 0 if ok else 1
