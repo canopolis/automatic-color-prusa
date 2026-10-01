@@ -28,6 +28,7 @@ jobs:
         run: |
           python pruebas/generar.py
           python convertir.py --mmu3 pruebas/modelo/esfera.obj 60
+          python convertir.py --mmu3 pruebas/modelo/esferaglb.glb 60
           $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
           python convertir.py --indx8 pruebas/modelo/esfera.obj 60
           python pruebas/verificar.py
@@ -41,6 +42,8 @@ jobs:
           Remove-Item -Recurse -Force pruebas/modelo
           python pruebas/generar.py
           ./dist/FullSpectrumPrusa.exe --mmu3 pruebas/modelo/esfera.obj 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./dist/FullSpectrumPrusa.exe --mmu3 pruebas/modelo/esferaglb.glb 60
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $env:INDX8_3MF = "pruebas/modelo/indx8_prueba.3mf"
           ./dist/FullSpectrumPrusa.exe --indx8 pruebas/modelo/esfera.obj 60
