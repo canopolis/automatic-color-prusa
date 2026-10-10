@@ -6,3 +6,11 @@ Arrastra un .obj full spectrum (con su .mtl y textura) sobre FullSpectrumPrusa.e
 La primera vez en INDX 8 pide un .3mf guardado en PrusaSlicer con la impresora "full color print indx8"
 (un cubo basta) y guarda su configuracion junto al exe.
 Salida: <nombre>_prusa_mmu3 o <nombre>_prusa_indx8 con el .3mf, vista_previa.png y reporte.txt.
+
+Cambios build-16 (sobre la version aprobada):
+- La cara se busca por contraste de TONO (ojos, labios), no por cantidad de manchas: las sombras de
+  plumas, pelo o rocas ya no se confunden con la cara (antes podia proteger un ala y dejar la cara borrosa).
+- La cara se conserva: ojos, cejas, nariz y labios nitidos; nada la altera despues.
+- Piel de un solo color: tono de referencia = piel clara del cuerpo; sombras rodeadas de piel pasan a piel.
+- Pezones/areolas (manchas pequenas mas rosadas que la piel) conservan su color.
+- Piel y pezones solo se procesan si se detecta una cara: en modelos sin cara el resultado es igual a build-15.

@@ -30,6 +30,13 @@ ZONA_CLASES = 24       # numero de familias de color para agrupar superficies li
 ZONA_TOL = 12.0        # una cara solo toma el tono de su zona si se parece a su propio color
 ZONA_MIN_MM2 = 30.0    # superficies lisas desde este tamano se pintan de un solo tono
 ISLA_MIN_MM2 = 2.0     # zonas de color mas pequenas que esto se funden con su vecina
+# build-16: cara elegida por tono, cara intacta, pezones protegidos y piel de un solo color
+PIEL_UN_COLOR = True     # la piel del cuerpo (fuera de cara y pezones) se imprime de un solo tono
+PIEL_TOL_MATIZ = 7.0     # la piel solo crece por tonos con menos de esta diferencia de matiz (grados)
+PIEL_TOL_AB = 8.0        # y con menos de esta diferencia de color (sin contar la luz): alas o telas parecidas quedan fuera
+PIEL_HUECO_MM2 = 600.0   # sombras encerradas por piel de hasta este tamano pasan a ser piel
+PEZON_MIN_MM2 = 2.0      # pezones/areolas: tamano minimo
+PEZON_MAX_MM2 = 150.0    # pezones/areolas: tamano maximo
 N_VIRTUALES = 105
 PASO_RATIO = 0.05
 BED = (125.0, 110.0)   # centro de la cama Core One
@@ -538,16 +545,94 @@ def convertir(path, altura):
         cc_ = np.stack([np.bincount(compd[rasgo_ok], weights=cen[rasgo_ok, j], minlength=nc)[ids] for j in range(3)], 1) / \
               np.bincount(compd[rasgo_ok], minlength=nc)[ids][:, None]
         vecin = (np.linalg.norm(cc_[:, None] - cc_[None], axis=2) < CARA_RADIO_MM).sum(1) - 1 if len(ids) else np.zeros(0)
-        cara = np.zeros(len(FV), bool)
+        cara = np.zeros(len(FV), bool); centro = None; rad = 0.0
         if len(ids) and vecin.max() >= CARA_MIN_RASGOS:
-            # la cara es el grupo mas denso de rasgos; se protege una esfera alrededor de su centro
-            centro = cc_[vecin == vecin.max()].mean(0)
+            # la cara es el grupo de rasgos con mas contraste de TONO (ojos, labios): las sombras de
+            # plumas, pelo o rocas forman grupos densos pero solo cambian de luz, no de tono
+            croma = np.linalg.norm(Lo[:, 1:] - entorno[:, 1:], axis=1)
+            cr = np.bincount(compd[rasgo_ok], weights=croma[rasgo_ok], minlength=nc)[ids] / \
+                 np.maximum(np.bincount(compd[rasgo_ok], minlength=nc)[ids], 1)
+            cerca_ = np.linalg.norm(cc_[:, None] - cc_[None], axis=2) < CARA_RADIO_MM
+            puntaje = (cerca_ * cr[None, :]).sum(1) / np.maximum(cerca_.sum(1), 1)
+            puntaje[vecin < CARA_MIN_RASGOS] = -1
+            centro = cc_[cerca_[int(puntaje.argmax())]].mean(0)
             sel = np.linalg.norm(cc_ - centro, axis=1) < CARA_RADIO_MM
             pts = cc_[sel]; rad = np.linalg.norm(pts - centro, axis=1).max() + RASGO_MARGEN_MM
             cara = np.linalg.norm(cen - centro, axis=1) < rad
         if cara.any(): break
     proteger = rasgo_ok | cara
     for _ in range(3): proteger = proteger | (proteger[Nn] & okN).any(1)
+    piel = np.zeros(len(FV), bool); pezon = np.zeros(len(FV), bool); ref = None
+    if PIEL_UN_COLOR and cara.any():      # solo en figuras con cara: sin cara el resultado es igual al de antes
+        hue = np.degrees(np.arctan2(Lo[:, 2], Lo[:, 1])) % 360; cro = np.hypot(Lo[:, 1], Lo[:, 2])
+        calido = ((hue < 95) | (hue > 340)) & (cro > 3) & (Lo[:, 0] > 30)
+        # tono de referencia: piel clara del centro de la cara (sin rasgos ni pelo ni sombras)
+        cand = np.zeros(len(FV), bool)
+        if centro is not None:
+            cand = cara & ~detalle & calido & (np.linalg.norm(cen - centro, axis=1) < rad * 0.6)
+        if cand.sum() < 30: cand = calido & ~detalle & (Lo[:, 0] > 45)
+        if cand.sum() >= 30:
+            Lk = Lo[cand]
+            h0 = np.degrees(np.arctan2(np.median(Lk[:, 2]), np.median(Lk[:, 1]))) % 360
+            dh0 = np.abs((np.degrees(np.arctan2(Lk[:, 2], Lk[:, 1])) % 360 - h0 + 180) % 360 - 180)
+            Lk = Lk[dh0 < 20] if (dh0 < 20).sum() >= 30 else Lk
+            ref = np.median(Lk[Lk[:, 0] >= np.median(Lk[:, 0])], 0)     # mitad clara = piel sin sombras
+        # tono de referencia: la piel CLARA del cuerpo (el pico de color de piel mas parecido a la cara;
+        # asi no se elige el color de alas, telas o pelo aunque ocupen mas superficie)
+        tibio = (hue > 30) & (hue < 70) & (cro > 6) & (cro < 35) & (Lo[:, 0] > 40) & ~cara & ~detalle
+        if tibio.sum() >= 30:
+            hb = np.clip(((hue[tibio] - 30) // 2).astype(int), 0, 19); cb = np.clip(((cro[tibio] - 6) // 2).astype(int), 0, 14)
+            Hh = np.zeros((20, 15)); np.add.at(Hh, (hb, cb), area[tibio])
+            orden = np.argsort(Hh.ravel())[::-1][:6]; pk = [(i // 15, i % 15) for i in orden if Hh.ravel()[i] >= 0.2 * Hh.max()]
+            if ref is not None:
+                hf = np.degrees(np.arctan2(ref[2], ref[1])) % 360; cf = np.hypot(ref[1], ref[2])
+                pk.sort(key=lambda q: abs(30 + 2 * q[0] + 1 - hf) + abs(6 + 2 * q[1] + 1 - cf))
+            hc, ccn = 30 + 2 * pk[0][0] + 1, 6 + 2 * pk[0][1] + 1
+            sel = tibio & (np.abs(hue - hc) < 4) & (np.abs(cro - ccn) < 4)
+            Lk = Lo[sel]; ref = np.median(Lk[Lk[:, 0] >= np.median(Lk[:, 0])], 0)   # mitad clara: piel sin sombras
+        if ref is not None:
+            href = np.degrees(np.arctan2(ref[2], ref[1])) % 360; cref = np.hypot(ref[1], ref[2])
+            dh = np.abs((hue - href + 180) % 360 - 180)
+            dab = np.linalg.norm(Lo[:, 1:] - ref[1:], axis=1)
+            # la piel crece desde la piel clara del cuerpo, de vecino en vecino: las sombras cambian poco a poco
+            # y entran; el borde con alas, pelo o telas es un salto de color y la detiene
+            # los bordes de textura (plumas, pliegues de tela, mechones) son una barrera: la piel es lisa
+            apto = (dab < PIEL_TOL_AB) & (dh < PIEL_TOL_MATIZ) & (Lo[:, 0] > 15) & ~cara & (dif <= DETALLE_DE)
+            piel = apto & (dab < 3) & (np.abs(Lo[:, 0] - ref[0]) < 12)
+            frente = np.nonzero(piel)[0]
+            while len(frente):
+                vv = N[frente]; ok_ = vv >= 0; src = np.repeat(frente, 3)[ok_.ravel()]; dst = vv[ok_]
+                paso = np.linalg.norm(Lo[dst, 1:] - Lo[src, 1:], axis=1) < 2.5
+                dst = np.unique(dst[paso & apto[dst] & ~piel[dst]])
+                piel[dst] = True; frente = dst
+            # pezones/areolas: manchas pequenas claramente MAS ROSADAS que la piel (las sombras solo oscurecen)
+            rosado = (Lo[:, 1] - ref[1] > 6) & (((href - hue + 180) % 360 - 180) > 8) & (Lo[:, 0] > ref[0] - 15) & ~cara
+            pielish = (dab < 14) & (Lo[:, 0] > 15) & ~cara       # piel en sentido amplio (incluye sombras) para el borde
+            rr = np.repeat(np.arange(len(FV)), 3); cN = N.ravel(); cvN = np.where(cN >= 0, cN, 0)
+            mz = (cN >= 0) & rosado[rr] & rosado[cvN]
+            nz, cz = connected_components(coo_matrix((np.ones(mz.sum()), (rr[mz], cN[mz])), shape=(len(FV),) * 2), directed=False)
+            az = np.bincount(cz, weights=area * rosado, minlength=nz)
+            borde = (cN >= 0) & rosado[rr] & ~rosado[cvN]
+            bp = np.bincount(cz[rr[borde]], weights=(pielish[cvN[borde]]).astype(float), minlength=nz)
+            bt = np.bincount(cz[rr[borde]], minlength=nz)
+            okz = (az >= PEZON_MIN_MM2) & (az <= PEZON_MAX_MM2) & (bp / np.maximum(bt, 1) > 0.7)
+            pezon = rosado & okz[cz]
+            for _ in range(2): pezon = pezon | (pezon[Nn] & okN).any(1)
+            pezon &= ~cara
+            piel &= ~pezon
+            # sombras y huecos rodeados de piel (abdomen, costillas, pliegues) pasan a ser piel
+            otro = ~piel & ~cara & ~pezon & ~rasgo_ok
+            mo = (cN >= 0) & otro[rr] & otro[cvN]
+            no, co_ = connected_components(coo_matrix((np.ones(mo.sum()), (rr[mo], cN[mo])), shape=(len(FV),) * 2), directed=False)
+            ao = np.bincount(co_, weights=area * otro, minlength=no)
+            bo = (cN >= 0) & otro[rr] & ~otro[cvN]
+            bpo = np.bincount(co_[rr[bo]], weights=(piel[cvN[bo]]).astype(float), minlength=no)
+            bto = np.bincount(co_[rr[bo]], minlength=no)
+            ho = np.bincount(co_, weights=dh * area * otro, minlength=no) / np.maximum(ao, 1e-9)
+            hueco = (ao <= PIEL_HUECO_MM2) & (bpo / np.maximum(bto, 1) > 0.75) & (ho < 25)
+            piel |= otro & hueco[co_]
+            print(f'      piel: tono {np.round(ref, 1).tolist()} | {area[piel].sum():.0f} mm2 | pezones/areolas: {int((okz & (bt > 0)).sum())} manchas')
+            proteger = proteger | pezon
     # color: zona protegida igual que antes (nitido en el detalle); resto con suavizado fuerte y uniforme
     PR.paso('Suavizando el color de piel y telas (el paso mas largo)')
     Lc = suavizar(lab(col), N, pasos)
@@ -555,6 +640,11 @@ def convertir(path, altura):
     pasos_piel = int(np.clip((SUAVIZADO_PIEL_MM / max(lado, 1e-6)) ** 2, pasos, 200))
     Lp = suavizar(Lc, N, pasos_piel - pasos, sigma=8.0) if pasos_piel > pasos else Lc
     Lc = np.where(proteger[:, None], Lc, Lp)
+    # cara: suavizado leve aprobado en la piel lisa y rasgos nitidos (ya calculado arriba); pezones: color original
+    intacto = pezon
+    Lc[intacto] = Lo[intacto]
+    cara_fija = cara & ~piel & ~pezon
+    if ref is not None: Lc[piel] = ref
     Wp = np.vstack([np.eye(5)[MODO['usables']], WV])
     PR.paso('Asignando un color a cada cara')
     idx = np.empty(len(Lc), int)
@@ -587,6 +677,12 @@ def convertir(path, altura):
     idx = quitar_islas(idx, N, area, ISLA_MIN_MM2, Lref=Lc, PL=PL, proteger=detalle & proteger)
     # uniformidad fuera de la zona protegida: parches de tono parecido se funden (piel, telas lisas)
     idx = quitar_islas(idx, N, area, UNIFORME_MM2, Lref=Lc, PL=PL, tol=UNIFORME_DE, proteger=proteger)
+    if intacto.any():
+        idx[intacto] = (dist(Lo[intacto], PL) + penal_piel(Lo[intacto], Wp)).argmin(1)
+    if cara_fija.any():      # la cara no la altera la unificacion de zonas ni la limpieza de manchas
+        idx[cara_fija] = (dist(Lc[cara_fija], PL) + penal_piel(Lc[cara_fija], Wp)).argmin(1)
+    if ref is not None and piel.any():
+        idx[piel] = int((dist(ref[None], PL) + penal_piel(ref[None], Wp)).argmin(1)[0])
     if os.environ.get('DEPURAR'): np.savez(os.environ['DEPURAR'], V=V, F=FV, co=col_orig, P=PAL, i=idx)
     estados = id_de[idx]                  # ids de PrusaSlicer: fisicos 1..N, virtuales N+1..
     carpeta = os.path.join(os.path.dirname(path), f'{nombre}_prusa_{MODO["sufijo"]}'); os.makedirs(carpeta, exist_ok=True)
@@ -595,7 +691,7 @@ def convertir(path, altura):
     vp = Image.new('RGB', (1220, 640), 'white'); vp.paste(prev[0], (0, 40)); vp.paste(prev[1], (620, 40))
     from PIL import ImageDraw; d = ImageDraw.Draw(vp); d.text((20, 10), 'Original', fill='black'); d.text((640, 10), f'{MODO["nombre"]} - ColorMix ({len(MODO["usables"])} reales + {len(PV)} virtuales)', fill='black')
     vp.save(os.path.join(carpeta, 'vista_previa.png'))
-    ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx, prot=proteger, det=detalle, Lc=Lc, clase=clase)
+    ULTIMO.update(V=V, FV=FV, col=col, col_orig=col_orig, PAL=PAL, idx=idx, prot=proteger, det=detalle, Lc=Lc, clase=clase, piel=piel, pezon=pezon, cara=cara)
     out = os.path.join(carpeta, f'{nombre}_colormix.3mf')
     PR.paso('Escribiendo el archivo 3MF')
     escribir_3mf(out, nombre, V, FV, estados, WV, PV, prev[1].resize((256, 256)))
