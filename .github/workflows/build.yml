@@ -23,6 +23,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install numpy scipy pillow pyinstaller
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Compilar motor ratdoux (ratdoux.dll)
+        shell: cmd
+        run: cl /nologo /O2 /std:c++17 /EHsc /LD cpp\colorin_wasm.cpp cpp\FullSpectrumKSPairResidual.cpp cpp\FullSpectrumICCPolynomialEstimator.cpp /Fe:ratdoux.dll /link /DEF:cpp\ratdoux.def
+      - name: Comprobar motor ratdoux
+        run: python -c "import convertir; assert convertir.RATDOUX() is not None, 'ratdoux.dll no carga'; print('ratdoux OK')"
       - name: Prueba del script (MMU3 e INDX 8)
         shell: pwsh
         run: |
@@ -35,7 +41,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item -Force plantilla_indx8.config
       - name: Compilar exe
-        run: pyinstaller --onefile --console --name FullSpectrumPrusa --icon icono.ico --add-data "plantilla_Slic3r_PE.config;." --collect-submodules scipy.sparse.csgraph convertir.py
+        run: pyinstaller --onefile --console --name FullSpectrumPrusa --icon icono.ico --add-data "plantilla_Slic3r_PE.config;." --add-binary "ratdoux.dll;." --collect-submodules scipy.sparse.csgraph convertir.py
       - name: Prueba del exe (MMU3 e INDX 8)
         shell: pwsh
         run: |
